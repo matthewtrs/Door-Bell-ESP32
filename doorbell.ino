@@ -3,11 +3,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <driver/i2s.h>
-#include <vector>
-#include <string>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
-#include "esp_adc_cal.h"
+#include "time.h"
+#include "esp_sntp.h"
 
 // I2S pins
 #define I2S_DATA_PIN 22
@@ -18,19 +15,30 @@
 #define SD_CS_PIN 5
 
 // WiFi credentials
-const char* ssid = "Met";
-const char* password = "30031973";
+const char *ssid = "Met";
+const char *password = "30031973";
 
-// NTP Client to get time
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org");
+// NTP Server settings
+const char *ntpServer1 = "pool.ntp.org";
+const char *ntpServer2 = "time.nist.gov";
 
-String getCurrentTime() { 
-    return timeClient.getFormattedTime(); 
+// Timezone for Western Indonesia Time (WIB), UTC+7, without daylight saving adjustments
+const char *time_zone = "WIB-7";
+
+// Callback function (gets called when time adjusts via NTP)
+void timeavailable(struct timeval *t) {
+    Serial.println("Got time adjustment from NTP!");
+    printLocalTime();
 }
 
-int messageCount = 0;  // Track the number of messages
-std::vector<String> bellTimes; // Track the bell ring times
+void printLocalTime() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        Serial.println("No time available (yet)");
+        return;
+    }
+    Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+}
 
 // Web server
 WebServer server(80);
@@ -53,9 +61,12 @@ const i2s_config_t i2s_config = {
 const i2s_pin_config_t pin_config = {
     .bck_io_num = I2S_CLOCK_PIN,
     .ws_io_num = I2S_LR_PIN,
-    .data_out_num = -1,    // Not used for RX
+    .data_out_num = -1, // Not used for RX
     .data_in_num = I2S_DATA_PIN
 };
+
+int messageCount = 0;  // Track the number of messages
+std::vector<String> bellTimes; // Track the bell ring times
 
 void updateInboxInHTML() {
     String html = "<html><body style='font-family: Arial, sans-serif;'>";
@@ -81,7 +92,9 @@ void updateBellTimesInHTML();
 void core0Task(void *pvParameters) {
     while (true) {
         server.handleClient();  // Handle HTTP requests
-        timeClient.update();    // Update NTP client
+        delay(1000); // Add delay
+        Serial.print("Free heap (Core 0): ");
+        Serial.println(ESP.getFreeHeap());
     }
 }
 
@@ -103,7 +116,7 @@ void core1Task(void *pvParameters) {
             case 4:
                 Serial.println("BUZZ");
                 // Store the current time in the list and update the HTML
-                bellTimes.push_back(getCurrentTime());
+                bellTimes.push_back(printLocalTime());
                 updateBellTimesInHTML();
                 delay(500); // Add a small delay to avoid multiple prints
                 break;
@@ -170,16 +183,23 @@ void setup() {
     Serial.println("I2S initialized");
 
     // Connect to WiFi
+    Serial.printf("Connecting to %s ", ssid);
     WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(1000);
-        Serial.println("Connecting to WiFi...");
-    }
-    Serial.println("WiFi connected");
 
-    // Initialize NTP client
-    timeClient.begin();
-    timeClient.setTimeOffset(25200); // Time offset for Western Indonesia Time (UTC +7 hours)
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println(" CONNECTED");
+
+    // Set NTP servers
+    esp_sntp_servermode_dhcp(1);  // Optional: Set SNTP server from DHCP
+
+    // Set time sync callback
+    sntp_set_time_sync_notification_cb(timeavailable);
+
+    // Configure time zone and daylight saving rules (Indonesia does not use daylight saving time)
+    configTzTime(time_zone, ntpServer1, ntpServer2);  // Use the correct timezone
 
     // Set up HTTP routes
     server.on("/audio", HTTP_GET, []() {
@@ -192,7 +212,7 @@ void setup() {
         }
     });
 
-        server.on("/", HTTP_GET, []() {
+    server.on("/", HTTP_GET, []() {
         String html = "<html><body style='font-family: Arial, sans-serif;'>";
         html += "<h1>ESP32 Dashboard</h1>";
 
@@ -224,7 +244,7 @@ void setup() {
         server.send(200, "text/html", html);
     });
 
-    server.on("/emergency", HTTP_GET, []() {
+        server.on("/emergency", HTTP_GET, []() {
         String html = "<html><head><style>";
         html += "@keyframes flash { 50% { opacity: 0.5; } }";
         html += "body { animation: flash 1s infinite; background-color: red; color: white; font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }";
@@ -246,6 +266,8 @@ void setup() {
     // Create tasks for Core 0 and Core 1
     xTaskCreatePinnedToCore(core0Task, "Core0Task", 10000, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(core1Task, "Core1Task", 10000, NULL, 1, NULL, 1);
+
+    Serial.println("Setup completed.");
 }
 
 void loop() {
@@ -260,7 +282,7 @@ void updateBellTimesInHTML() {
     html += "<div style='margin-bottom: 20px;'>";
     html += "<h2>Case 4</h2>";
     for (const auto& time : bellTimes) {
-      html += "<p><img src='https://example.com/bell_icon.png' alt='Bell Icon' style='width:16px;height:16px;'> Bel bunyi jam: " + time + "</p>";
+        html += "<p><img src='https://example.com/bell_icon.png' alt='Bell Icon' style='width:16px;height:16px;'> Bel bunyi jam: " + time + "</p>";
     }
     html += "</div>";
 
@@ -269,7 +291,7 @@ void updateBellTimesInHTML() {
     html += "<h2>Case 34</h2>";
     html += "<p>" + String(messageCount) + " inbox</p>";
     for (int i = 1; i <= messageCount; i++) {
-      html += "<p><a href='/message/" + String(i) + "'>View Msg " + String(i) + "</a></p>";
+        html += "<p><a href='/message/" + String(i) + "'>View Msg " + String(i) + "</a></p>";
     }
     html += "</div>";
 
