@@ -1,361 +1,304 @@
+#include "ESP_I2S.h"
 #include <SD.h>
-#include <SPI.h>
+#include "SPI.h"
 #include <WiFi.h>
 #include <WebServer.h>
-#include <driver/i2s.h>
-#include "time.h"
-#include "esp_sntp.h"
+#include <esp_now.h>
 
-// I2S pins
-#define I2S_DATA_PIN 22
-#define I2S_CLOCK_PIN 14
-#define I2S_LR_PIN 15
+#define I2S_DATA_PIN 22  // I2S data pin (connect to SD)
+#define I2S_CLOCK_PIN 14 // I2S clock pin (connect to SCK)
+#define I2S_LR_PIN 15    // I2S word select pin (connect to WS)
+#define I2S_LR_CONTROL_PIN 13 // Left/Right control pin (LOW for left or HIGH for right)
 
-// SD card CS pin
-#define SD_CS_PIN 5
+#define SD_CS_PIN 5 // Chip select pin for SD card
+#define ESPNOW_WIFI_CHANNEL 6
 
-// WiFi credentials
-const char *ssid = "Met";
-const char *password = "30031973";
+I2SClass I2S;
 
-// NTP Server settings
-const char *ntpServer1 = "pool.ntp.org";
-const char *ntpServer2 = "time.nist.gov";
+// Wi-Fi Credentials
+const char* ssid = "Met"; // Your WiFi SSID
+const char* password = "30031973"; // Your WiFi password
+int count = 0;
+String messages = "";
 
-// Timezone for Western Indonesia Time (WIB), UTC+7, without daylight saving adjustments
-const char *time_zone = "WIB-7";
+// Set the initial time (e.g., 08:00)
+int hours = 8;
+int minutes = 0;
 
-// Callback function (gets called when time adjusts via NTP)
-void timeavailable(struct timeval *t) {
-    Serial.println("Got time adjustment from NTP!");
-    printLocalTime();
+// Slave Address
+uint8_t broadcastAddress[] = {0x24, 0x6F, 0x28, 0xAB, 0xCD, 0xEF};
+
+struct __attribute__((packed)) dataPacket {
+  int state;
+};
+
+esp_now_peer_info_t peerInfo;
+
+// Function to send data ESP-NOW
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
 
-void printLocalTime() {
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
-        Serial.println("No time available (yet)");
-        return;
+// Function to update time
+void updateTime(void *parameter) {
+  while (true) {
+    vTaskDelay(60000 / portTICK_PERIOD_MS); // Delay 1 minute
+    minutes++;
+    if (minutes >= 60) {
+      minutes = 0;
+      hours++;
+      if (hours >= 24) {
+        hours = 0;
+      }
     }
-    Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+  }
 }
 
-// Web server
+// ESP-NOW message structure
+typedef struct struct_message {
+  int gpio4State;
+} struct_message;
+
+struct_message myData;
+
 WebServer server(80);
 
-// I2S configuration
-const i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = 16000,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 512,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
-};
-
-const i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_CLOCK_PIN,
-    .ws_io_num = I2S_LR_PIN,
-    .data_out_num = -1, // Not used for RX
-    .data_in_num = I2S_DATA_PIN
-};
-
-int messageCount = 0;  // Track the number of messages
-std::vector<String> bellTimes; // Track the bell ring times
-
-void updateInboxInHTML() {
-    String html = "<html><body style='font-family: Arial, sans-serif;'>";
-    html += "<h1>ESP32 Dashboard</h1>";
-
-    // Case 34
-    html += "<div style='margin-bottom: 20px;'>";
-    html += "<h2>Case 34</h2>";
-    html += "<p>" + String(messageCount) + " inbox</p>";
-    for (int i = 1; i <= messageCount; i++) {
-        html += "<p><a href='/message/" + String(i) + "'>View Msg " + String(i) + "</a></p>";
-    }
-    html += "</div>";
-
-    html += "</body></html>";
-
-    // Tampilkan HTML ke dalam log serial (atau Anda bisa memperbarui halaman web)
-    Serial.println(html);
-}
-
-void updateBellTimesInHTML();
-
-void core0Task(void *pvParameters) {
-    while (true) {
-        server.handleClient();  // Handle HTTP requests
-        delay(1000); // Add delay
-        Serial.print("Free heap (Core 0): ");
-        Serial.println(ESP.getFreeHeap());
-    }
-}
-
-void core1Task(void *pvParameters) {
-    int gpioState = LOW;
-    while (true) {
-        // Read the state of the GPIO pins
-        gpioState = LOW;
-        if (digitalRead(4) == HIGH) {
-            gpioState = 4;  // Button 1 (GPIO4)
-        } else if (digitalRead(34) == HIGH) {
-            gpioState = 34; // Button 2 (GPIO34)
-        } else if (digitalRead(35) == HIGH) {
-            gpioState = 35; // Button 3 (GPIO35)
-        }
-
-        // Use switch-case to handle each GPIO button press
-        switch (gpioState) {
-            case 4:
-                Serial.println("BUZZ");
-                // Store the current time in the list and update the HTML
-                bellTimes.push_back(printLocalTime());
-                updateBellTimesInHTML();
-                delay(500); // Add a small delay to avoid multiple prints
-                break;
-
-            case 34:
-                Serial.println("Recording...");
-                // Start recording audio from INMP441 and save to SD card
-                recordVoiceToSD();
-                // After recording, update the message count and upload to HTML
-                messageCount++;
-                updateInboxInHTML();
-                break;
-
-            case 35:
-                Serial.println("Emergency");
-                // Redirect to the emergency route to trigger the emergency page
-                server.sendHeader("Location", "/emergency", true);
-                server.send(302, "text/plain", "");
-                delay(500);
-                break;
-
-            default:
-                // Default case for when no button is pressed
-                break;
-        }
-    }
+// Function to write WAV header
+void writeWavHeader(fs::File &file, uint32_t dataSize, uint16_t numChannels, uint32_t sampleRate) {
+    // Write WAV header
+    file.write((const uint8_t*)"RIFF", 4);
+    file.write((uint8_t)((dataSize + 36) & 0xFF));
+    file.write((uint8_t)(((dataSize + 36) >> 8) & 0xFF));
+    file.write((uint8_t)(((dataSize + 36) >> 16) & 0xFF));
+    file.write((uint8_t)(((dataSize + 36) >> 24) & 0xFF));
+    file.write((const uint8_t*)"WAVE", 4);
+    file.write((const uint8_t*)"fmt ", 4);
+    file.write((uint8_t)16);  // Subchunk1Size (16 for PCM)
+    file.write((uint8_t)0);
+    file.write((uint8_t)0);
+    file.write((uint8_t)0);
+    file.write((uint8_t)1);   // AudioFormat (1 for PCM)
+    file.write((uint8_t)0);
+    file.write((uint8_t)numChannels); // NumChannels
+    file.write((uint8_t)0);
+    file.write((uint8_t)(sampleRate & 0xFF)); // SampleRate
+    file.write((uint8_t)((sampleRate >> 8) & 0xFF));
+    file.write((uint8_t)((sampleRate >> 16) & 0xFF));
+    file.write((uint8_t)((sampleRate >> 24) & 0xFF));
+    file.write((uint8_t)((sampleRate * numChannels * 2) & 0xFF)); // ByteRate
+    file.write((uint8_t)(((sampleRate * numChannels * 2) >> 8) & 0xFF));
+    file.write((uint8_t)(((sampleRate * numChannels * 2) >> 16) & 0xFF));
+    file.write((uint8_t)(((sampleRate * numChannels * 2) >> 24) & 0xFF));
+    file.write((uint8_t)(numChannels * 2)); // BlockAlign
+    file.write((uint8_t)0);
+    file.write((uint8_t)16);  // BitsPerSample
+    file.write((uint8_t)0);
+    file.write((const uint8_t*)"data", 4);
+    file.write((uint8_t)(dataSize & 0xFF)); // Subchunk2Size (data size)
+    file.write((uint8_t)((dataSize >> 8) & 0xFF));
+    file.write((uint8_t)((dataSize >> 16) & 0xFF));
+    file.write((uint8_t)((dataSize >> 24) & 0xFF));
 }
 
 void setup() {
-    Serial.begin(115200);
+  // Start the serial communication
+  Serial.begin(115200);
 
-    // Set GPIO pins as input
-    pinMode(4, INPUT);
-    pinMode(34, INPUT);
-    pinMode(35, INPUT);
+  // Set GPIO pins as input
+  pinMode(4, INPUT);
+  pinMode(34, INPUT);
+  pinMode(35, INPUT);
 
-    analogReadResolution(12); // Resolusi ADC hingga 12-bit (default 10-bit)
+  // Initialize SD card
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD card initialization failed!");
+    return;
+  }
+  Serial.println("SD card initialized.");
 
-    // Initialize SD card
-    if (!SD.begin(SD_CS_PIN)) {
-        Serial.println("SD card initialization failed!");
-        return;
+  // Initialize I2S for INMP441 microphone
+  I2S.setPins(I2S_DATA_PIN, I2S_LR_PIN, I2S_CLOCK_PIN);
+    if (!I2S.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_24BIT, I2S_SLOT_MODE_MONO)) {
+      Serial.println("Error initializing I2S");
+    return; }
+  Serial.println("I2S initialized");
+
+  // Set the L/R control pin to LOW for left channel (mono)
+  pinMode(I2S_LR_CONTROL_PIN, OUTPUT);
+  digitalWrite(I2S_LR_CONTROL_PIN, LOW);
+
+  // Setup ESP-NOW wifi mode
+  WiFi.mode(WIFI_STA);
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("WiFi connected");
+
+  // Serve the recorded audio file
+  server.on("/audio", HTTP_GET, []() {
+    File audioFile = SD.open("/ESP32_DATA/voice_record.wav", FILE_READ);
+    if (audioFile) {
+      server.streamFile(audioFile, "audio/wav");
+      audioFile.close();
+    } else {
+      server.send(404, "text/plain", "File not found");
     }
-    Serial.println("SD card initialized.");
+  });
 
-    // Check if the directory exists, and create it if not
-    if (!SD.exists("/ESP32_DATA")) {
-        Serial.println("Directory /ESP32_DATA does not exist. Creating directory...");
-        if (SD.mkdir("/ESP32_DATA")) {
-            Serial.println("Directory created successfully.");
-        } else {
-            Serial.println("Failed to create directory.");
-            return;
-        }
-    }
+  // Serve a simple HTML page with a button to download the file
+  server.on("/", HTTP_GET, []() {
+    String html = "<!DOCTYPE html><html><head><title>ESP32 Buzz Record</title></head><body>";
+    html += "<h1>ESP32 Buzz Record</h1>";
+    html += "<div id='buzzRecords'>";
+    html += messages; // Display buzz records
+    html += "</div>";
+    html += "<p><a href='/audio'><button>Download Recorded Audio</button></a></p>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
 
-    // Initialize I2S
-    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    if (err != ESP_OK) {
-        Serial.println("Failed to install I2S driver");
-        return;
-    }
-    i2s_set_pin(I2S_NUM_0, &pin_config);
-    Serial.println("I2S initialized");
+  // Start the server
+  server.begin();
+  Serial.println("Server started");
 
-    // Connect to WiFi
-    Serial.printf("Connecting to %s ", ssid);
-    WiFi.begin(ssid, password);
-
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println(" CONNECTED");
-
-    // Set NTP servers
-    esp_sntp_servermode_dhcp(1);  // Optional: Set SNTP server from DHCP
-
-    // Set time sync callback
-    sntp_set_time_sync_notification_cb(timeavailable);
-
-    // Configure time zone and daylight saving rules (Indonesia does not use daylight saving time)
-    configTzTime(time_zone, ntpServer1, ntpServer2);  // Use the correct timezone
-
-    // Set up HTTP routes
-    server.on("/audio", HTTP_GET, []() {
-        File audioFile = SD.open("/ESP32_DATA/voice_record.wav", FILE_READ);
-        if (audioFile) {
-            server.streamFile(audioFile, "audio/wav");
-            audioFile.close();
-        } else {
-            server.send(404, "text/plain", "File not found");
-        }
-    });
-
-    server.on("/", HTTP_GET, []() {
-        String html = "<html><body style='font-family: Arial, sans-serif;'>";
-        html += "<h1>ESP32 Dashboard</h1>";
-
-        // Case 4
-        html += "<div style='margin-bottom: 20px;'>";
-        html += "<h2>Case 4</h2>";
-        for (const auto& time : bellTimes) {
-            html += "<p><img src='https://example.com/bell_icon.png' alt='Bell Icon' style='width:16px;height:16px;'> Bel bunyi jam: " + time + "</p>";
-        }
-        html += "</div>";
-
-        // Case 34
-        html += "<div style='margin-bottom: 20px;'>";
-        html += "<h2>Case 34</h2>";
-        if (messageCount > 0) {
-            html += "<p><a href='/messages' style='color: blue;'>" + String(messageCount) + " messages left</a></p>";
-        } else {
-            html += "<p style='color: gray;'>0 messages left</p>";
-        }
-        html += "</div>";
-
-        // Case 35
-        html += "<div style='margin-bottom: 20px;'>";
-        html += "<h2>Case 35</h2>";
-        html += "<p><a href='/emergency'><button style='color: white; background: red; padding: 10px;'>Trigger Emergency</button></a></p>";
-        html += "</div>";
-
-        html += "</body></html>";
-        server.send(200, "text/html", html);
-    });
-
-        server.on("/emergency", HTTP_GET, []() {
-        String html = "<html><head><style>";
-        html += "@keyframes flash { 50% { opacity: 0.5; } }";
-        html += "body { animation: flash 1s infinite; background-color: red; color: white; font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }";
-        html += "</style>";
-        html += "<script>function playSound() { var audio = new Audio('https://example.com/alert_sound.mp3'); audio.play(); }</script>";
-        html += "</head><body onload='playSound()'>";
-        html += "<div>";
-        html += "<h1 style='font-size: 5em;'>Emergency!</h1>";
-        html += "<img src='https://example.com/emergency_icon.png' alt='Emergency Icon' style='width:64px;height:64px;'>";
-        html += "<p><button onclick='muteSound()' style='padding: 10px;'>Mute</button></p>";
-        html += "<p><button style='padding: 10px; background: white; color: red;'>Acknowledge</button></p>";
-        html += "<p><button style='padding: 10px; background: white; color: red;'>Notify Authorities</button></p>";
-        html += "</div>";
-        html += "<script>function muteSound() { var audio = new Audio('https://example.com/alert_sound.mp3'); audio.pause(); }</script>";
-        html += "</body></html>";
-        server.send(200, "text/html", html);
-    });
-
-    // Create tasks for Core 0 and Core 1
-    xTaskCreatePinnedToCore(core0Task, "Core0Task", 10000, NULL, 1, NULL, 0);
-    xTaskCreatePinnedToCore(core1Task, "Core1Task", 10000, NULL, 1, NULL, 1);
-
-    Serial.println("Setup completed.");
+  // Create a FreeRTOS task for the clock update
+  xTaskCreatePinnedToCore(
+    updateTime,   // Function to implement the task
+    "Update Time", // Name of the task
+    1000,         // Stack size in words
+    NULL,         // Task input parameter
+    1,            // Priority of the task
+    NULL,         // Task handle
+    0);           // Core where the task should run (0 in this case)
 }
 
 void loop() {
-    // Empty loop as tasks are handled by FreeRTOS
-}
+  // Read the state of the GPIO pins
+  int gpioState = LOW;
 
-void updateBellTimesInHTML() {
-    String html = "<html><body style='font-family: Arial, sans-serif;'>";
-    html += "<h1>ESP32 Dashboard</h1>";
+  if (digitalRead(4) == HIGH) {
+    gpioState = 4;  // Button 1 (GPIO4)
+  } else if (digitalRead(34) == HIGH) {
+    gpioState = 34; // Button 2 (GPIO34)
+  } else if (digitalRead(35) == HIGH) {
+    gpioState = 35; // Button 3 (GPIO35)
+  }
 
-    // Case 4
-    html += "<div style='margin-bottom: 20px;'>";
-    html += "<h2>Case 4</h2>";
-    for (const auto& time : bellTimes) {
-        html += "<p><img src='https://example.com/bell_icon.png' alt='Bell Icon' style='width:16px;height:16px;'> Bel bunyi jam: " + time + "</p>";
-    }
-    html += "</div>";
+  // Use switch-case to handle each GPIO button press
+  switch (gpioState) {
+    case 4:
+      Serial.println("BUZZ");
+      espnowmaster();
+      timebuzz();
+      break;
 
-    // Case 34
-    html += "<div style='margin-bottom: 20px;'>";
-    html += "<h2>Case 34</h2>";
-    html += "<p>" + String(messageCount) + " inbox</p>";
-    for (int i = 1; i <= messageCount; i++) {
-        html += "<p><a href='/message/" + String(i) + "'>View Msg " + String(i) + "</a></p>";
-    }
-    html += "</div>";
+    case 34:
+      Serial.println("Recording...");
+      recordVoiceToSD();
+      break;
 
-    // Case 35
-    html += "<div style='margin-bottom: 20px;'>";
-    html += "<h2>Case 35</h2>";
-    html += "<p><a href='/emergency'><button style='color: white; background: red; padding: 10px;'>Trigger Emergency</button></a></p>";
-    html += "</div>";
+    case 35:
+      Serial.println("Emergency");
+      // Add emergency actions here, like sending a notification
+      delay(500);
+      break;
 
-    html += "</body></html>";
-    server.send(200, "text/html", html);
+    default:
+      // Default case for when no button is pressed
+      break;
+  }
+
+  server.handleClient();  // Handle HTTP requests
 }
 
 void recordVoiceToSD() {
-    File audioFile = SD.open("/ESP32_DATA/voice_record.wav", FILE_WRITE);
-    if (!audioFile) {
-        Serial.println("Error opening file for recording.");
-        return;
-    }
+  // Prepare file on SD card for saving the audio data
+  File audioFile = SD.open("/ESP32_DATA/voice_record.wav", FILE_WRITE);
+  if (!audioFile) {
+    Serial.println("Error opening file for recording.");
+    return;
+  }
 
-    // Write WAV header
-    writeWAVHeader(audioFile);
+  // Write WAV header
+  writeWavHeader(audioFile, 0, 1, 16000); // dataSize=0, numChannels=1 (mono), sampleRate=16000
 
-    // Read and save I2S data
-    int16_t buffer[512];
+  // Set up buffer for I2S data
+  int32_t buffer[512];  // Buffer for 24-bit audio
+
+  unsigned long startMillis = millis();
+  // Record for up to 20 seconds
+  while (millis() - startMillis < 20000) {
+    // Read I2S data into the buffer
     size_t bytesRead = 0;
-    unsigned long startMillis = millis();
-
-    while (millis() - startMillis < 20000) {  // Record for 20 seconds
-        i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
-        audioFile.write((uint8_t*)buffer, bytesRead);
+    for (int i = 0; i < sizeof(buffer) / sizeof(buffer[0]); i++) {
+      int32_t sample = I2S.read();
+      if (sample != -1) {
+        buffer[i] = sample;
+        bytesRead += 3; // Each sample is 3 bytes (24-bit)
+      }
     }
 
-    // Update file sizes in header
-    unsigned long fileSize = audioFile.size();
-    audioFile.seek(4);
-    audioFile.write((uint8_t*)&fileSize, 4);
-    audioFile.seek(40);
-    unsigned long dataChunkSize = fileSize - 44;
-    audioFile.write((uint8_t*)&dataChunkSize, 4);
+    if (bytesRead > 0) {
+      // Write data to the SD card
+      audioFile.write((uint8_t *)buffer, bytesRead);
+    }
+  }
 
-    audioFile.close();
-    Serial.println("Recording saved to SD card.");
+  // Finalize WAV file size in header
+  unsigned long fileSize = audioFile.size();
+  audioFile.seek(4);
+  audioFile.write((fileSize - 8) & 0xFF);  // Update the file size in the header
+  audioFile.seek(40);
+  audioFile.write((fileSize - 44) & 0xFF); // Update the data size in the header
+
+  audioFile.close();
+  Serial.println("Recording saved to SD card.");
 }
 
-void writeWAVHeader(File& file) {
-    uint32_t fileSize = 36 + 1000 * 512;  // Placeholder values
-    uint32_t dataChunkSize = 1000 * 512;
-    uint16_t audioFormat = 1, numChannels = 1, bitsPerSample = 16;
-    uint32_t sampleRate = 16000, byteRate = sampleRate * numChannels * bitsPerSample / 8;
-    uint16_t blockAlign = numChannels * bitsPerSample / 8;
+void espnowmaster() {
+  dataPacket packet;
+  packet.state = digitalRead(4);
 
-    file.write((const uint8_t*)"RIFF", 4);
-    file.write((uint8_t*)&fileSize, 4);
-    file.write((const uint8_t*)"WAVE", 4);
-    file.write((const uint8_t*)"fmt ", 4);
-    uint32_t subChunk1Size = 16;
-    file.write((uint8_t*)&subChunk1Size, 4);
-    file.write((uint8_t*)&audioFormat, 2);
-    file.write((uint8_t*)&numChannels, 2);
-    file.write((uint8_t*)&sampleRate, 4);
-    file.write((uint8_t*)&byteRate, 4);
-    file.write((uint8_t*)&blockAlign, 2);
-    file.write((uint8_t*)&bitsPerSample, 2);
-    file.write((const uint8_t*)"data", 4);
-    file.write((uint8_t*)&dataChunkSize, 4);
+  // Send the ESP-NOW message
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&packet, sizeof(packet));
+
+  // Check the result of the send operation
+  if (result != ESP_OK) {
+    Serial.println("Failed to send ESP-NOW message.");
+  }
+
+  delay(30); // Small delay to avoid multiple triggers in quick succession
+}
+
+void timebuzz() {
+  // Format the time and add it to the messages string
+  String timeString = String(hours) + ":" + (minutes < 10 ? "0" : "") + String(minutes);
+  messages += "<p>BUZZ at " + timeString + "</p>";
+  count++;
+  if (count > 5) {
+    messages = ""; // Clear the messages after 5 records
+    count = 0;
+  }
 }
