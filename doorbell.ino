@@ -31,6 +31,7 @@ struct __attribute__((packed)) espnowMessage {
 
 // Variables for web interface
 String messages = "";
+int recordingCounter = 0;       // Counter for unique filenames
 bool newVoiceMessageAvailable = false; // Flag for new voice message
 
 // I2S configuration
@@ -41,8 +42,8 @@ const i2s_config_t i2s_config = {
   .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
   .communication_format = I2S_COMM_FORMAT_I2S_MSB,
   .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-  .dma_buf_count = 8,
-  .dma_buf_len = 512,
+  .dma_buf_count = 16,
+  .dma_buf_len = 1024,
   .use_apll = false,
   .tx_desc_auto_clear = false,
   .fixed_mclk = 0
@@ -55,12 +56,24 @@ const i2s_pin_config_t pin_config = {
   .data_in_num = I2S_DATA_PIN
 };
 
+// State Machine States
+enum State {
+  IDLE,
+  BUZZER_ACTIVE,
+  RECORDING,
+  EMERGENCY,
+  FIRE_ALERT
+};
+
+State currentState = IDLE; // Initial state
+
 // Function to handle received ESP-NOW data
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+void OnDataRecv(const esp_now_recv_info_t *mac, const uint8_t *incomingData, int len) {
   espnowMessage receivedMsg;
   memcpy(&receivedMsg, incomingData, sizeof(receivedMsg));
 
   if (strcmp(receivedMsg.type, "FIRE") == 0 && receivedMsg.state == 1) {
+    currentState = FIRE_ALERT; // Transition to FIRE_ALERT state
     messages = "FIRE ALERT"; // Update the web interface message
     Serial.println("FIRE ALERT received from ESP-01");
   }
@@ -85,36 +98,72 @@ void sendEspNowMessage(const char* type, int state) {
 
 // Function to record voice to SD card
 void recordVoiceToSD() {
-  File audioFile = SD.open("/ESP32_DATA/voice_record.wav", FILE_WRITE);
-  if (!audioFile) {
-    Serial.println("Error opening file for recording.");
-    return;
+  int retryCount = 0;
+  const int maxRetries = 3; // Maximum number of retries
+  bool fileSavedSuccessfully = false;
+
+  while (retryCount < maxRetries && !fileSavedSuccessfully) {
+    // Generate a unique filename
+    String filename = "/ESP32_DATA/voice_record_" + String(recordingCounter) + ".wav";
+    recordingCounter++; // Increment the counter for the next recording
+
+    // Open the file for writing
+    File audioFile = SD.open(filename, FILE_WRITE);
+    if (!audioFile) {
+      Serial.println("Error opening file for recording.");
+      retryCount++;
+      continue; // Skip to the next retry
+    }
+
+    // Write WAV header
+    writeWAVHeader(audioFile);
+
+    // Read and save I2S data
+    int16_t buffer[512];
+    size_t bytesRead = 0;
+    unsigned long startMillis = millis();
+
+    while (millis() - startMillis < 20000) { // Record for 20 seconds
+      i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
+      audioFile.write((uint8_t*)buffer, bytesRead);
+    }
+
+    // Update file sizes in header
+    unsigned long fileSize = audioFile.size();
+    audioFile.seek(4);
+    audioFile.write((uint8_t*)&fileSize, 4);
+    audioFile.seek(40);
+    unsigned long dataChunkSize = fileSize - 44;
+    audioFile.write((uint8_t*)&dataChunkSize, 4);
+
+    audioFile.close();
+    Serial.println("Recording saved to SD card: " + filename);
+
+    // Verify that the file is really available on the SD card
+    if (verifyFileExists(filename)) {
+      Serial.println("File verification successful: " + filename);
+      fileSavedSuccessfully = true; // Mark as successfully saved
+      newVoiceMessageAvailable = true; // Set flag for new voice message
+    } else {
+      Serial.println("File verification failed: " + filename);
+      retryCount++; // Increment retry count
+    }
   }
 
-  // Write WAV header
-  writeWAVHeader(audioFile);
-
-  // Read and save I2S data
-  int16_t buffer[512];
-  size_t bytesRead = 0;
-  unsigned long startMillis = millis();
-
-  while (millis() - startMillis < 20000) { // Record for 20 seconds
-    i2s_read(I2S_NUM_0, buffer, sizeof(buffer), &bytesRead, portMAX_DELAY);
-    audioFile.write((uint8_t*)buffer, bytesRead);
+  if (!fileSavedSuccessfully) {
+    Serial.println("Failed to save recording after " + String(maxRetries) + " retries.");
   }
+}
 
-  // Update file sizes in header
-  unsigned long fileSize = audioFile.size();
-  audioFile.seek(4);
-  audioFile.write((uint8_t*)&fileSize, 4);
-  audioFile.seek(40);
-  unsigned long dataChunkSize = fileSize - 44;
-  audioFile.write((uint8_t*)&dataChunkSize, 4);
-
-  audioFile.close();
-  Serial.println("Recording saved to SD card.");
-  newVoiceMessageAvailable = true; // Set flag for new voice message
+// Function to verify if a file exists on the SD card
+bool verifyFileExists(const String& filename) {
+  File file = SD.open(filename, FILE_READ);
+  if (file) {
+    file.close();
+    return true; // File exists and is accessible
+  } else {
+    return false; // File does not exist or cannot be opened
+  }
 }
 
 // Function to write WAV header
@@ -203,7 +252,11 @@ void setup() {
   }
   Serial.println("WiFi connected");
 
-  // Serve the recorded audio file
+  // Print the IP address
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Set up HTTP routes
   server.on("/", HTTP_GET, []() {
     String html = "<!DOCTYPE html><html><head><title>ESP32 Doorbell</title></head><body>";
     html += "<h1>ESP32 Doorbell</h1>";
@@ -216,13 +269,16 @@ void setup() {
       html += "<p><strong>1 Voice message available</strong></p>";
     }
 
-    html += "<p><a href='/audio'><button>Download Recorded Audio</button></a></p>";
+    html += "<p><a href='/download?file=" + String(recordingCounter - 1) + "'><button>Download Latest Recording</button></a></p>";
     html += "</body></html>";
     server.send(200, "text/html", html);
   });
 
-  server.on("/audio", HTTP_GET, []() {
-    File audioFile = SD.open("/ESP32_DATA/voice_record.wav", FILE_READ);
+  server.on("/download", HTTP_GET, []() {
+    String fileIndex = server.arg("file");
+    String filename = "/ESP32_DATA/voice_record_" + fileIndex + ".wav";
+
+    File audioFile = SD.open(filename, FILE_READ);
     if (audioFile) {
       server.sendHeader("Content-Type", "audio/wav");
       server.streamFile(audioFile, "audio/wav");
@@ -238,46 +294,51 @@ void setup() {
   // Start the server
   server.begin();
   Serial.println("Server started");
-  Serial.print("Server IP address: ");
-  Serial.println(WiFi.localIP());
 }
 
 void loop() {
-  // Read the state of the GPIO pins
-  int gpioState = LOW;
+  // Handle HTTP requests
+  server.handleClient();
 
-  if (digitalRead(4) == HIGH) {
-    gpioState = 4;  // Button 1 (GPIO4)
-  } else if (digitalRead(34) == HIGH) {
-    gpioState = 34; // Button 2 (GPIO34)
-  } else if (digitalRead(35) == HIGH) {
-    gpioState = 35; // Button 3 (GPIO35)
-  }
+  // State Machine Logic
+  switch (currentState) {
+    case IDLE:
+      // Check for button presses
+      if (digitalRead(4) == HIGH) {
+        currentState = BUZZER_ACTIVE;
+      } else if (digitalRead(34) == HIGH) {
+        currentState = RECORDING;
+      } else if (digitalRead(35) == HIGH) {
+        currentState = EMERGENCY;
+      }
+      break;
 
-  // Use switch-case to handle each GPIO button press
-  switch (gpioState) {
-    case 4:
+    case BUZZER_ACTIVE:
       Serial.println("BUZZ");
       sendEspNowMessage("BUZZER", 1); // Send "BUZZER ON" to ESP-01
       timebuzz();
       delay(500);
+      currentState = IDLE; // Return to IDLE state
       break;
 
-    case 34:
+    case RECORDING:
       Serial.println("Recording...");
       recordVoiceToSD();
+      currentState = IDLE; // Return to IDLE state
       break;
 
-    case 35:
+    case EMERGENCY:
       Serial.println("Emergency");
-      // Add emergency actions here, like sending a notification
+      // Add emergency actions here
       delay(500);
+      currentState = IDLE; // Return to IDLE state
       break;
 
-    default:
-      // Default case for when no button is pressed
+    case FIRE_ALERT:
+      // Handle fire alert (e.g., display message, trigger alarms)
+      Serial.println("FIRE ALERT active");
+      delay(1000); // Simulate handling
+      currentState = IDLE; // Return to IDLE state
       break;
   }
-
-  server.handleClient();  // Handle HTTP requests
 }
