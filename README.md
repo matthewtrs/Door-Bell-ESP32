@@ -3,7 +3,7 @@
 ## Universitas Indonesia
 **Final Project Report: Embedded Systems 02-01**
 
-**Author:** Matthew Tristan Hutapea – 2206056085  
+**Author:** Matthew Tristan Hutapea  
 **Department:** Faculty of Engineering, Electrical Engineering Program  
 **Location:** Depok, West Java 16424  
 **Date:** January 2025
