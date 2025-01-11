@@ -14,8 +14,8 @@
 #define SD_CS_PIN 5
 
 // WiFi credentials
-const char* ssid = "Met";
-const char* password = "30031973";
+const char* ssid = "...";
+const char* password = "...";
 
 // Web server
 WebServer server(80);
